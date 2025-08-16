@@ -6,9 +6,16 @@ import torch.nn.functional as F
 
 try:
     from flash_attn_interface import flash_attn_func  # type: ignore[import]
+    FLASH_ATTN_AVAILABLE = True
 except ImportError:
-    # Fallback to FlashAttention 2
-    from flash_attn import flash_attn_func  # type: ignore[import]
+    try:
+        # Fallback to FlashAttention 2
+        from flash_attn import flash_attn_func  # type: ignore[import]
+        FLASH_ATTN_AVAILABLE = True
+    except ImportError:
+        # No FlashAttention available, will use standard attention
+        FLASH_ATTN_AVAILABLE = False
+        flash_attn_func = None
 
 from models.common import trunc_normal_init_
 
@@ -88,8 +95,8 @@ class RotaryEmbedding(nn.Module):
 
         # Different from paper, but it uses a different permutation in order to obtain the same calculation
         emb = torch.cat((freqs, freqs), dim=-1)
-        self.cos_cached = nn.Buffer(emb.cos(), persistent=False)
-        self.sin_cached = nn.Buffer(emb.sin(), persistent=False)
+        self.register_buffer('cos_cached', emb.cos(), persistent=False)
+        self.register_buffer('sin_cached', emb.sin(), persistent=False)
 
     def forward(self):
         return self.cos_cached, self.sin_cached
@@ -126,13 +133,33 @@ class Attention(nn.Module):
             cos, sin = cos_sin
             query, key = apply_rotary_pos_emb(query, key, cos, sin)
 
-        # flash attn
-        attn_output = flash_attn_func(q=query, k=key, v=value, causal=self.causal)
-        if isinstance(attn_output, tuple):  # fa2 and fa3 compatibility
-            attn_output = attn_output[0]
-
-        # attn_output: [batch_size, num_heads, seq_len, head_dim]
-        attn_output = attn_output.view(batch_size, seq_len, self.output_size)  # type: ignore
+        if FLASH_ATTN_AVAILABLE:
+            # flash attn
+            attn_output = flash_attn_func(q=query, k=key, v=value, causal=self.causal)
+            if isinstance(attn_output, tuple):  # fa2 and fa3 compatibility
+                attn_output = attn_output[0]
+            # attn_output: [batch_size, seq_len, num_heads, head_dim]
+            attn_output = attn_output.view(batch_size, seq_len, self.output_size)
+        else:
+            # Standard PyTorch attention fallback
+            # query, key, value: [batch_size, seq_len, num_heads, head_dim]
+            # Transpose to [batch_size, num_heads, seq_len, head_dim] for scaled_dot_product_attention
+            query = query.transpose(1, 2)  # [batch_size, num_heads, seq_len, head_dim]
+            key = key.transpose(1, 2)      # [batch_size, num_key_value_heads, seq_len, head_dim]
+            value = value.transpose(1, 2)  # [batch_size, num_key_value_heads, seq_len, head_dim]
+            
+            # Handle grouped query attention by repeating key/value heads if needed
+            if self.num_key_value_heads != self.num_heads:
+                key = key.repeat_interleave(self.num_heads // self.num_key_value_heads, dim=1)
+                value = value.repeat_interleave(self.num_heads // self.num_key_value_heads, dim=1)
+            
+            attn_output = F.scaled_dot_product_attention(
+                query, key, value, 
+                is_causal=self.causal
+            )
+            # attn_output: [batch_size, num_heads, seq_len, head_dim]
+            attn_output = attn_output.transpose(1, 2).contiguous()  # [batch_size, seq_len, num_heads, head_dim]
+            attn_output = attn_output.view(batch_size, seq_len, self.output_size)
         return self.o_proj(attn_output)
 
 
